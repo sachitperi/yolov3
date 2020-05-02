@@ -2,8 +2,10 @@ from __future__ import  division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import variable
+from torch.autograd import Variable
 import numpy as np
+from util import *
+import cv2
 
 def parsecfg(cfgfile):
     """
@@ -161,6 +163,115 @@ class EmptyLayer(nn.Module):
     def __init__(self):
         super(EmptyLayer, self).__init__()
 
-blocks = parsecfg("./cfg/yolov3.cfg")
-# print(blocks)
-print(create_modules(blocks))
+class Darknet(nn.Module):
+    def __init__(self, cfgfile):
+        super(Darknet, self).__init__()
+        self.blocks = parsecfg(cfgfile)
+        self.net_info, self.module_list = create_modules(self.blocks)
+
+    # implimenting the forward pass of the network
+    def forward(self, x, CUDA):
+        """
+        The forward pass serves two purpose first to calculate the output and second to transform the output detection featuremaps in a way that it can be processed
+        easier (eg: transforming them such that detection across multiple scales can be concatenated, which otherwise isnt possible as they are of different dimensions)
+
+        Since route and shortcut layers need output maps from previous layers, we cache the output feature maps of every layer in a dict `outputs`.
+        Keys are indices of the layer and values are the feature maps
+
+        Iterate over module_list which contains the modules of the network. The modules have been appended in the same order as they are present in the config file.
+        This means we can simply run our input through each module.
+
+        :param x: input x
+        :param CUDA: if true would use gpu
+        :return:
+        """
+        modules = self.blocks[1:]
+        outputs = {} # Cache the outputs for route layer
+
+        write = 0
+        for i, module in enumerate(modules):
+            module_type = (module["type"])
+
+            # if the module is a convolutional or upsample layer this is how the forward pass should work
+            if module_type == "convolutional" or module_type == "upsample":
+                x = self.module_list[i](x)
+
+            # route layer and shortcut layer
+            # In Route layer we have to account for two cases.
+            # For cases where we have to concatenate the feature maps we use torch.cat function with second argument as 1.
+            # This is because we want to concatenate the feature maps along the depth. (Pytorch has input and output of convolutionals layer has the format BxCxHxW.
+            # The depth corresponding to the channel dimension)
+
+            elif module_type == "route":
+                layers = module["layers"]
+                layers = [int(a) for a in layers]
+
+                if (layers[0]) > 0:
+                    layers[0] = layers[0] - i
+
+                if len(layers) == 1:
+                    x = outputs[i + (layers[0])]
+
+                else:
+                    if (layers[1]) > 0:
+                        layers[1] = layers[1] - i
+
+                    map1 = outputs[i + layers[0]]
+                    map2 = outputs[i + layers[1]]
+
+                    x = torch.cat((map1, map2), 1)
+
+            elif module_type == "shortcut":
+                from_ = int(module["from"])
+                x = outputs[i-1] + outputs[i+from_]
+
+            # Yolo detection layer
+            # The output of yolo is a convolutional featuremap that contains the bounding box attributes along the depth of the featuremap
+            # The attributes bounding-box predicted by a cell are stacked one by one along each other
+            # second bounding of a cell at (5, 6) will have to index it by map [5, 6, (5+c): 2*(5+c)]
+            # This form is inconvineant for output processing such as thresholding by output confidence, adding grid ofsets to centers, applying anchors etc
+            # Also since detections happen at 3 scales the dimensions of prediction maps will be different.
+            # Although the dimensions of featuremaps are different the output processing operations on them are similar. It would be nice to do these operations on a single tensor,
+            # rather than three separate tensors
+            # for this the function predict_transforms from utils.py is used to transform the output tensor a table with bounding boxes as its rows an concatenating is easy
+            # An obstacle is that we cannot initialize an empty tensor and then concatenate a non-empty tensor (of different shape) to it. so delay initialization until we get our first detection map
+            # write=0 flag is used to indicate whether we have reached the first detection or not.
+
+            elif module_type=="yolo":
+                anchors=self.module_list[i][0].anchors
+                # get input dimensions
+                inp_dim = int(self.net_info["height"])
+                # get the number of classes
+                num_classes = int(module["classes"])
+                # Transform
+                x = x.data
+                x = predict_transforms(x, inp_dim, anchors, num_classes, CUDA)
+                if not write:
+                    detections = x
+                    write = 1
+
+                else:
+                    detections = torch.cat((detections, x), 1)
+            outputs[i] = x
+        return detections
+
+    # testing forwardpass
+
+def get_test_input():
+    img = cv2.imread("dog-cycle-car.png")
+    img = cv2.resize(img, (416, 416)) # resize the input dimension
+    img_ = img[:,:,::-1].transpose((2, 0, 1)) # BGR -> RGB | HxWXC -> CxHXW
+    img_ = img_[np.newaxis, :, :, :]/255.0 # Add a channel at 0 for batch | Normalize
+    img_ = torch.from_numpy(img_).float() # convert to float
+    img_ = Variable(img_)
+    return img_
+
+# Main
+# blocks = parsecfg("./cfg/yolov3.cfg")
+# # print(blocks)
+# print(create_modules(blocks))
+model = Darknet("./cfg/yolov3.cfg")
+inp = get_test_input()
+# print(inp)
+pred = model(inp, torch.cuda.is_available())
+print(pred)

@@ -94,4 +94,5 @@
                 exposure = 1.5
                 hue=.1
             ```                          
-4)  Defining the Network 
+4)  Downloading the weight file
+ 

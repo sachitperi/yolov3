@@ -255,8 +255,107 @@ class Darknet(nn.Module):
             outputs[i] = x
         return detections
 
-    # testing forwardpass
+    def load_weights(self, weightfile):
+        """
+        Weight file is a binary file that contains weights stored in a serial fashion.
+        The weights are stored as floats with nothing to guide us to which layer they belong to.
+        Hence extreme caution must be prepared in terms of reading the weights file.
+        The weights belong to only two types of layers batchnorm or convolution layer.
+        Weights for these layers are stored in exactly same order as they appear in the cfg file.
+        eg: if a convolution is followed by a shortcut block and then the shortcut block by another convolution block,
+        you will expect the file to contain the weights of previous convolution block followed by those of the later
 
+        When batchnorm layers appears in a convolution block there are no biases. However when there is no batchnorm layer,
+        "bias" and "weights" have to be read from the file
+
+        :param weightfile:
+        :return:
+        """
+        # open the weights file
+        fp = open(weightfile, 'rb')
+
+        # the first 5 values are header information
+        # 1. Major version Number
+        # 2. Minor version number
+        # 3. Subversion Number
+        # 4, 5. Images seen by the network (during training)
+        header = np.fromfile(fp, dtype=np.int32, count=5)
+        self.header = torch.from_numpy(header)
+        self.seen = self.header[3]
+
+        # the weights are stored as float32
+        weights = np.fromfile(fp, dtype=np.float32)
+        # iterate over weight file and load the weights into modules of our network
+        ptr = 0 # variable used to keep track of where we are in the weights file
+        for i in range(len(self.module_list)):
+            module_type = self.blocks[i+1]["type"]
+
+            # if module_type is convolutional load_weights otherwise ignore
+            # first check if convolution block has batchnormalize
+            if module_type == "convolutional":
+                model = self.module_list[i]
+                try:
+                    batch_normalize = int(self.blocks[i+1]["batch_normalize"])
+                except:
+                    batch_normalize = 0
+
+                conv = model[0]
+
+                if batch_normalize:
+                    bn = model[1]
+
+                    # get the number of weights of batchnorm layer
+                    num_bn_biases = bn.bias.numel()
+
+                    # load the weights
+                    bn_biases = torch.from_numpy(weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    bn_weights = torch.from_numpy(weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    bn_running_mean = torch.from_numpy(weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    bn_running_var = torch.from_numpy(weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    # cast the loaded weights into dims of loaded weights
+                    bn_biases = bn_biases.view_as(bn.bias.data)
+                    bn_weights = bn_weights.view_as(bn.weight.data)
+                    bn_running_mean = bn_running_mean.view_as(bn.running_mean)
+                    bn_running_var = bn_running_var.view_as(bn.running_var)
+
+                    # copy the data to model
+                    bn.bias.data.copy_(bn_biases)
+                    bn.weight.data.copy_(bn_weights)
+                    bn.running_mean.copy_(bn_running_mean)
+                    bn.running_var.copy_(bn_running_var)
+
+                else:
+                    # number of biases
+                    num_biases = conv.bias.numel()
+                    # load the weights
+                    conv_biases = torch.from_numpy(weights[ptr:ptr+num_biases])
+                    ptr = ptr + num_biases
+
+                    # reshape the loaded weights according to the dims of model weights
+                    conv_biases = conv_biases.view_as(conv.bias.data)
+
+                    # finally copy the data
+                    conv.bias.data.copy_(conv_biases)
+
+                # let us load the weights for the convolution layer
+                num_weights = conv.weights.numel()
+
+                # do the same as above for weights
+                conv_weights = torch.from_numpy(weights[ptr:ptr+num_weights])
+                ptr = ptr + num_weights
+
+                conv_weights = conv_weights.view_as(conv.weight.data)
+                conv.weight.data.copy_(conv_weights)
+
+# testing forwardpass
 def get_test_input():
     img = cv2.imread("dog-cycle-car.png")
     img = cv2.resize(img, (416, 416)) # resize the input dimension
@@ -271,6 +370,7 @@ def get_test_input():
 # # print(blocks)
 # print(create_modules(blocks))
 model = Darknet("./cfg/yolov3.cfg")
+model.load_weights("yolov3.weights")
 inp = get_test_input()
 # print(inp)
 pred = model(inp, torch.cuda.is_available())
